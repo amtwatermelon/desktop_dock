@@ -1,0 +1,273 @@
+:root {
+  font-family: 'Inter', 'PingFang SC', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-size: 14px;
+  line-height: 1.4;
+  color: #f7f8ff;
+  background-color: #101014;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #101014;
+  color: inherit;
+}
+
+#app,
+.app-shell {
+  min-height: 100vh;
+}
+
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  background: linear-gradient(180deg, #12121a 0%, #050506 100%);
+  overflow: hidden;
+}
+
+.toolbar {
+  padding: 4px 12px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  background: rgba(8, 8, 12, 0.92);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(10px);
+}
+
+.tabs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  flex: 1;
+}
+
+.tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.tab {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px 6px 14px;
+  border: none;
+  border-radius: 12px;
+  color: #cfd5ff;
+  background: rgba(255, 255, 255, 0.05);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease;
+  flex-shrink: 0;
+}
+
+.tab.active {
+  background: linear-gradient(120deg, #2563eb, #7c3aed);
+  color: #ffffff;
+}
+
+.tab-default-badge {
+  margin-left: 8px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.2);
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.tab-title {
+  max-width: 150px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tab-close {
+  padding-left: 4px;
+  font-size: 16px;
+  line-height: 1;
+  opacity: 0.6;
+}
+
+.tab-close:hover {
+  opacity: 1;
+}
+
+.tab.add {
+  width: 32px;
+  height: 32px;
+  justify-content: center;
+  padding: 0;
+  border-radius: 50%;
+  font-size: 18px;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.address-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+}
+
+.icon-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border: none;
+  border-radius: 8px;
+  background: rgba(59, 130, 246, 0.15);
+  color: #9fc5ff;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  flex-shrink: 0;
+}
+
+.icon-button svg {
+  pointer-events: none;
+  user-select: none;
+}
+
+.icon-button:hover:not(:disabled) {
+  background: rgba(59, 130, 246, 0.3);
+  color: #ffffff;
+  transform: translateY(-1px);
+}
+
+.icon-button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.go-button {
+  background: linear-gradient(120deg, #2563eb, #7c3aed);
+  color: #ffffff;
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.35);
+}
+
+.go-button:hover:not(:disabled) {
+  background: linear-gradient(120deg, #3b82f6, #8b5cf6);
+}
+
+.close-button {
+  font-size: 18px;
+  background: rgba(244, 63, 94, 0.15);
+  color: #ffb4c4;
+}
+
+.address-input {
+  flex: 1;
+  padding: 11px 14px;
+  border-radius: 10px;
+  border: none;
+  background: rgba(255, 255, 255, 0.9);
+  color: #101427;
+  font-size: 14px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), inset 0 1px 2px rgba(255, 255, 255, 0.05);
+  transition: background 0.2s ease, box-shadow 0.2s ease;
+}
+
+.address-input:disabled {
+  background: rgba(255, 255, 255, 0.5);
+  cursor: not-allowed;
+}
+
+.address-input:focus {
+  outline: none;
+  background: #ffffff;
+  box-shadow: 0 0 0 2px rgba(99, 163, 255, 0.5), 0 10px 26px rgba(37, 99, 235, 0.25);
+}
+
+.address-input::placeholder {
+  color: rgba(16, 20, 39, 0.6);
+}
+
+.webview-container {
+  flex: 1;
+  position: relative;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(8, 8, 12, 0.92);
+}
+
+.viewport {
+  position: absolute;
+  overflow: hidden;
+}
+
+/* Windows 平台使用 inset */
+.platform-win32 .viewport {
+  inset: 0 0 0 0;
+}
+
+/* macOS 平台使用 top 和 bottom */
+.platform-darwin .viewport {
+  top: 28px;
+  left: 0;
+  right: 0;
+  bottom: -28px;
+}
+
+.viewport__placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  color: rgba(255, 255, 255, 0.65);
+  letter-spacing: 0.2px;
+  transition: opacity 0.2s ease;
+  pointer-events: none;
+}
+
+.viewport[data-loaded='true'] .viewport__placeholder {
+  opacity: 0;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    background-color: #f4f4f7;
+    color: #111;
+  }
+
+  .app-shell {
+    background: #f3f5ff;
+  }
+
+  .toolbar {
+    background: rgba(255, 255, 255, 0.95);
+    border-bottom-color: rgba(0, 0, 0, 0.08);
+  }
+
+  .tab {
+    color: #1e1f2b;
+    background: rgba(0, 0, 0, 0.04);
+  }
+
+  .address-input {
+    background: rgba(240, 242, 247, 0.95);
+    color: #0c1220;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08), inset 0 1px 2px rgba(0, 0, 0, 0.02);
+  }
+
+  .icon-button {
+    background: rgba(59, 130, 246, 0.12);
+    color: #3b82f6;
+  }
+
+  .webview-container {
+    background: rgba(255, 255, 255, 0.95);
+    border-color: rgba(0, 0, 0, 0.06);
+  }
+}
+
