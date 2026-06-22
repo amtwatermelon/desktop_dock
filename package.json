@@ -10,7 +10,7 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "tauri:build:universal": "bash ./scripts/build-mac-universal.sh",
-    "deploy:github": "git push https://github.com/your-username/your-repo.git main"
+    "deploy:github": "git push github master"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.10",

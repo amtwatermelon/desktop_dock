@@ -2,12 +2,24 @@
 
 ## Mac 构建（GitHub Actions 远程）
 
-> GitHub Actions **仅在仓库托管在 github.com 时**会自动运行。当前 origin 为 `git.saledrama.com` 时，需先 Mirror 到 GitHub 或添加 `github` remote 并推送。
+> GitHub Actions **仅在仓库托管在 github.com 时**会自动运行。
 
-1. 将本仓库推送到 GitHub（例如 `git remote add github git@github.com:你的账号/desktop_dock.git`）
-2. 打开 GitHub 仓库 → **Actions** → **Build macOS DMG**
-3. 点击 **Run workflow** 手动触发，或推送 `master` / `main` 分支自动触发
-4. 构建完成后，在对应 Run 页面底部 **Artifacts** 下载 `007-desk-macos-dmg`（内含 `007-Desk-universal.dmg`）
+**GitHub 仓库：** https://github.com/xuyabin88-prog/dock.git
+
+```bash
+# 首次（远程已添加为 github 时可跳过 add）
+git remote add github https://github.com/xuyabin88-prog/dock.git
+git push -u github master
+
+# 之后更新
+pnpm deploy:github
+# 或
+git push github master
+```
+
+3. 打开 GitHub 仓库 → **Actions** → **Build macOS DMG**
+4. 点击 **Run workflow** 手动触发，或推送 `master` 后自动触发
+5. 构建完成后，在 Run 页面底部 **Artifacts** 下载 `007-desk-macos-dmg`
 
 本地无需 Mac 环境；构建在 GitHub 的 `macos-latest` 机器上执行。
 
