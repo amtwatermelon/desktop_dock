@@ -1,63 +1,80 @@
 name: Build Desktop App (macOS + Windows)
 
-# 推送 main 分支时，同时在 macOS 和 Windows 两台 runner 上构建
 on:
   push:
-    branches: [ main ]
+    branches: [main, master]
   pull_request:
-    branches: [ main ]
+    branches: [main, master]
   workflow_dispatch:
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false   # 任一平台失败不会取消另一个平台
-      matrix:
-        include:
-          - os: macos-latest
-            target: universal-apple-darwin   # Mac 通用二进制（同时支持 Apple Silicon + Intel）
-            artifact_name: macos-dmg
-            artifact_path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: windows-installer
-            artifact_path: |
-              src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
-              src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
-
-    runs-on: ${{ matrix.os }}
-
+  build-macos:
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v2
+      - uses: pnpm/action-setup@v4
         with:
           version: 8
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
         with:
-          targets: ${{ matrix.target }}
+          node-version: 20
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Add macOS Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
-      - name: Build Tauri app
-        run: pnpm tauri build --target ${{ matrix.target }}
+      - name: Build universal DMG
+        run: pnpm tauri:build:universal
         env:
-          # Tauri 更新签名密钥（在 GitHub Secrets 里配置即可；不配置也照常打包，只是不签名）
           TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
 
-      - name: Upload artifacts
+      - name: Upload DMG
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.artifact_path }}
+          name: macos-dmg
+          path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 8
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Windows installer
+        run: pnpm tauri build --target x86_64-pc-windows-msvc
+        env:
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
           if-no-files-found: warn
