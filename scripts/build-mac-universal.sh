@@ -2,12 +2,17 @@
 set -euo pipefail
 
 # 构建 arm64 和 x86_64 两个架构的 Tauri 应用
+# CI / 本地统一通过 pnpm exec 调用 tauri CLI
+
+run_tauri() {
+  pnpm exec tauri "$@"
+}
 
 echo "[1/4] Building arm64 (M-chip) app..."
-tauri build --target aarch64-apple-darwin
+run_tauri build --target aarch64-apple-darwin
 
 echo "[2/4] Building x86_64 (Intel) app..."
-tauri build --target x86_64-apple-darwin
+run_tauri build --target x86_64-apple-darwin
 
 # 路径变量（注意 productName: 007 Desk）
 APP_NAME="007 Desk.app"
