@@ -32,7 +32,7 @@ type Bounds = {
   height: number;
 };
 
-const DEFAULT_URL = 'https://www.007proxy.uk/dock/login';
+const DEFAULT_URL = 'https://www.007chats.xyz/dock/login';
 const appWindow = getCurrentWindow();
 
 // 检测平台并添加类名
