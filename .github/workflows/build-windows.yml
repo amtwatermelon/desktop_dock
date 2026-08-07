@@ -1,4 +1,4 @@
-name: Build Desktop App (macOS + Windows)
+name: Build Windows Installer
 
 on:
   push:
@@ -8,41 +8,6 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-macos:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 9
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: pnpm
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Add macOS Rust targets
-        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Build universal DMG
-        run: pnpm tauri:build:universal
-        env:
-          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
-          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
-
-      - name: Upload DMG
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-dmg
-          path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
-          if-no-files-found: error
-
   build-windows:
     runs-on: windows-latest
     steps:
