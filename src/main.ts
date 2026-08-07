@@ -32,7 +32,19 @@ type Bounds = {
   height: number;
 };
 
-const DEFAULT_URL = 'https://www.007chats.xyz/dock/login';
+const ORIGINAL_DEFAULT_URL = 'https://www.007proxy.uk/dock/login';
+const DEFAULT_URL_STORAGE_KEY = 'dock.defaultLoginUrl';
+
+const readStoredDefaultUrl = () => {
+  try {
+    const stored = localStorage.getItem(DEFAULT_URL_STORAGE_KEY);
+    return stored && stored.trim() ? stored.trim() : ORIGINAL_DEFAULT_URL;
+  } catch {
+    return ORIGINAL_DEFAULT_URL;
+  }
+};
+
+let DEFAULT_URL = readStoredDefaultUrl();
 const appWindow = getCurrentWindow();
 
 // 检测平台并添加类名
@@ -65,19 +77,45 @@ app.innerHTML = `
   <div class="app-shell">
     <header class="toolbar">
       <div class="tabs" id="tab-list"></div>
+      <button type="button" id="settings-btn" class="tab add settings-btn" aria-label="设置默认登录地址" title="设置默认登录地址">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+      </button>
       <button type="button" id="add-tab" class="tab add" aria-label="新建页签">+</button>
     </header>
     <section class="webview-container">
       <div id="viewport" class="viewport">
         <p class="viewport__placeholder">创建页签后，页面会在这里加载。</p>
+        <div class="viewport__loading" id="viewport-loading" aria-hidden="true">
+          <span class="spinner" aria-hidden="true"></span>
+          <span class="viewport__loading-text">加载中…</span>
+        </div>
       </div>
     </section>
+    <div class="modal-overlay" id="settings-modal" aria-hidden="true">
+      <div class="modal-card" role="dialog" aria-modal="true" aria-label="设置默认登录地址">
+        <h3 class="modal-title">设置默认登录地址</h3>
+        <input type="text" id="settings-url-input" class="address-input modal-input" placeholder="https://www.example.com/dock/login" spellcheck="false" autocomplete="off" />
+        <div class="modal-actions">
+          <button type="button" id="settings-reset" class="modal-btn modal-btn--reset">重置</button>
+          <button type="button" id="settings-save" class="modal-btn modal-btn--save">保存</button>
+        </div>
+      </div>
+    </div>
   </div>
 `;
 
 const viewportEl = document.querySelector<HTMLDivElement>('#viewport')!;
+const viewportLoadingEl = document.querySelector<HTMLDivElement>('#viewport-loading')!;
 const tabListEl = document.querySelector<HTMLDivElement>('#tab-list')!;
 const addTabBtn = document.querySelector<HTMLButtonElement>('#add-tab')!;
+const settingsBtnEl = document.querySelector<HTMLButtonElement>('#settings-btn')!;
+const settingsModalEl = document.querySelector<HTMLDivElement>('#settings-modal')!;
+const settingsInputEl = document.querySelector<HTMLInputElement>('#settings-url-input')!;
+const settingsSaveBtnEl = document.querySelector<HTMLButtonElement>('#settings-save')!;
+const settingsResetBtnEl = document.querySelector<HTMLButtonElement>('#settings-reset')!;
 
 const tabs: TabRecord[] = [];
 let activeTabId: string | null = null;
@@ -217,12 +255,45 @@ const syncViewportState = () => {
   }
 };
 
+const setLoading = (loading: boolean) => {
+  if (loading) {
+    viewportLoadingEl.classList.add('open');
+    viewportLoadingEl.setAttribute('aria-hidden', 'false');
+  } else {
+    viewportLoadingEl.classList.remove('open');
+    viewportLoadingEl.setAttribute('aria-hidden', 'true');
+  }
+};
+
 const syncBounds = async (tab: TabRecord) => {
   if (!tab.view) return;
   const bounds = getViewportBounds();
   await tab.view.setPosition(new LogicalPosition(bounds.x, bounds.y));
   await tab.view.setSize(new LogicalSize(bounds.width, bounds.height));
 };
+
+// 轮询子 webview 的 document.readyState，加载完成（或超时）后再展示，避免白屏
+const waitForWebviewLoad = (view: Webview, timeoutMs = 12000) =>
+  new Promise<void>((resolve) => {
+    const startedAt = Date.now();
+    const tick = async () => {
+      try {
+        const ready = (await (view as any).eval('document.readyState')) as string;
+        if (ready === 'complete') {
+          resolve();
+          return;
+        }
+      } catch {
+        // webview 尚未就绪，忽略后继续轮询
+      }
+      if (Date.now() - startedAt >= timeoutMs) {
+        resolve();
+        return;
+      }
+      window.setTimeout(tick, 200);
+    };
+    window.setTimeout(tick, 150);
+  });
 
 const instantiateView = (id: string, url: string, shouldFocus: boolean) => {
   const bounds = getViewportBounds();
@@ -250,6 +321,27 @@ const instantiateView = (id: string, url: string, shouldFocus: boolean) => {
   }
 
   return view;
+};
+
+// 创建子 webview：始终先隐藏，加载完成（显示 loading）后再显示，避免加载期间白屏
+const presentWebview = async (tab: TabRecord, url: string) => {
+  const isActive = tab.id === activeTabId;
+  tab.view = instantiateView(tab.id, url, false);
+
+  if (!isActive || !tab.view) {
+    tab.view?.hide().catch(() => undefined);
+    return;
+  }
+
+  setLoading(true);
+  try {
+    await syncBounds(tab);
+    await waitForWebviewLoad(tab.view);
+  } finally {
+    setLoading(false);
+  }
+  await tab.view.show().catch(() => undefined);
+  await tab.view.setFocus().catch(() => undefined);
 };
 
 const setActiveTab = async (id: string | null) => {
@@ -303,18 +395,9 @@ const recreateTabView = async (tab: TabRecord, targetUrl: string) => {
     await tab.view.close().catch(() => undefined);
   }
 
-  const isActive = tab.id === activeTabId;
-  tab.view = instantiateView(tab.id, targetUrl, isActive);
   applyTabUrl(tab, targetUrl);
+  await presentWebview(tab, targetUrl);
   startUrlWatcher(tab);
-
-  if (isActive && tab.view) {
-    await syncBounds(tab);
-    await tab.view.show().catch(() => undefined);
-    await tab.view.setFocus().catch(() => undefined);
-  } else if (tab.view) {
-    await tab.view.hide().catch(() => undefined);
-  }
 };
 
 const loadUrlInTab = async (tab: TabRecord, url: string) => {
@@ -360,10 +443,10 @@ const createTab = async () => {
     // 2. 对默认标签，再异步创建 Webview；即使失败也不影响标签本身显示
     if (isFirst) {
       try {
-        tab.view = instantiateView(id, DEFAULT_URL, true);
-        await syncBounds(tab);
+        await presentWebview(tab, DEFAULT_URL);
         startUrlWatcher(tab);
       } catch (viewError) {
+        setLoading(false);
         console.error('默认标签 Webview 创建失败:', viewError);
       }
     }
@@ -456,8 +539,100 @@ const showUrlError = async () => {
   await message('请输入合法的网址', { title: '提示', kind: 'warning' });
 };
 
+const reloadDefaultTab = async (url: string) => {
+  const defaultTab = tabs.find((tab) => tab.isDefault);
+  if (!defaultTab) return;
+  defaultTab.url = url;
+  await recreateTabView(defaultTab, url).catch((error) => {
+    console.error('重载默认标签失败:', error);
+  });
+};
+
+// 子 webview 是叠在主窗口之上的原生窗口，弹窗期间需要全部隐藏，否则会被遮住
+const hideAllWebviews = () =>
+  Promise.all(
+    tabs.map((tab) => (tab.view ? tab.view.hide().catch(() => undefined) : Promise.resolve()))
+  );
+
+const showActiveWebview = async () => {
+  const active = getActiveTab();
+  if (!active?.view) return;
+  await syncBounds(active);
+  await active.view.show().catch(() => undefined);
+  await active.view.setFocus().catch(() => undefined);
+};
+
+const hideSettingsModal = () => {
+  settingsModalEl.classList.remove('open');
+  settingsModalEl.setAttribute('aria-hidden', 'true');
+};
+
+const openSettingsModal = async () => {
+  settingsInputEl.value = DEFAULT_URL;
+  await hideAllWebviews();
+  settingsModalEl.classList.add('open');
+  settingsModalEl.setAttribute('aria-hidden', 'false');
+  settingsInputEl.focus();
+  settingsInputEl.select();
+};
+
+const closeSettingsModal = async () => {
+  hideSettingsModal();
+  await showActiveWebview();
+};
+
+const saveDefaultUrl = async () => {
+  const finalUrl = ensureProtocol(settingsInputEl.value);
+  if (!finalUrl) {
+    await message('请输入合法的网址', { title: '提示', kind: 'warning' });
+    return;
+  }
+  DEFAULT_URL = finalUrl;
+  try {
+    localStorage.setItem(DEFAULT_URL_STORAGE_KEY, finalUrl);
+  } catch (error) {
+    console.warn('保存默认登录地址失败:', error);
+  }
+  hideSettingsModal();
+  await reloadDefaultTab(finalUrl);
+  await showActiveWebview();
+};
+
+const resetDefaultUrl = async () => {
+  DEFAULT_URL = ORIGINAL_DEFAULT_URL;
+  try {
+    localStorage.removeItem(DEFAULT_URL_STORAGE_KEY);
+  } catch (error) {
+    console.warn('重置默认登录地址失败:', error);
+  }
+  hideSettingsModal();
+  await reloadDefaultTab(ORIGINAL_DEFAULT_URL);
+  await showActiveWebview();
+};
+
 addTabBtn.addEventListener('click', () => {
   void createTab();
+});
+
+settingsBtnEl.addEventListener('click', openSettingsModal);
+settingsSaveBtnEl.addEventListener('click', () => {
+  void saveDefaultUrl();
+});
+settingsResetBtnEl.addEventListener('click', () => {
+  void resetDefaultUrl();
+});
+settingsModalEl.addEventListener('click', (event) => {
+  if (event.target === settingsModalEl) {
+    void closeSettingsModal();
+  }
+});
+settingsInputEl.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    void saveDefaultUrl();
+  } else if (event.key === 'Escape') {
+    void closeSettingsModal();
+  }
 });
 
 // 添加全局测试函数，可以在控制台直接调用
