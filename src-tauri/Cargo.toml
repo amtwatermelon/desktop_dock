@@ -7,6 +7,12 @@ edition = "2021"
 tauri = { version = "2.10", features = ["unstable", "devtools"] }
 tauri-plugin-dialog = "2.7"
 tauri-plugin-notification = "2.3"
+# 直接使用 rfd 同步文件对话框（tauri-plugin-dialog 底层同款库）。
+# on_download 回调在主线程同步执行，插件的 blocking_save_file 会向主线程
+# 事件循环投递任务并同步等待，形成自等待死锁；rfd 的同步 API 检测到已在
+# 主线程时就地弹出模态对话框（runModal / IFileDialog::Show 内部自行泵事件），
+# 在该回调里是安全的。
+rfd = { version = "0.16", default-features = false, features = ["common-controls-v6"] }
 
 [build-dependencies]
 tauri-build = { version = "2.5", features = [] }

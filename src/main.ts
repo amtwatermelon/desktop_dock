@@ -1,4 +1,5 @@
 import './style.css';
+import { invoke } from '@tauri-apps/api/core';
 import { Webview } from '@tauri-apps/api/webview';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { LogicalPosition, LogicalSize } from '@tauri-apps/api/dpi';
@@ -295,17 +296,24 @@ const waitForWebviewLoad = (view: Webview, timeoutMs = 12000) =>
     window.setTimeout(tick, 150);
   });
 
-const instantiateView = (id: string, url: string, shouldFocus: boolean) => {
+// 通过 Rust 侧命令创建子 webview：只有这样才能在构建时挂上 on_download 下载处理器，
+// 页面里的下载（图片/视频/文件）才会弹出"另存为"对话框。JS 的 new Webview(...) 不行。
+const instantiateView = async (id: string, url: string, shouldFocus: boolean) => {
   const bounds = getViewportBounds();
-  
-  const view = new Webview(appWindow, id, {
+
+  await invoke('create_tab_webview', {
+    label: id,
     url,
     x: bounds.x,
     y: bounds.y,
     width: bounds.width || 1280,
     height: bounds.height || 720,
-    focus: shouldFocus,
   });
+
+  const view = await Webview.getByLabel(id);
+  if (!view) {
+    throw new Error(`webview ${id} not found after creation`);
+  }
 
   view.once('tauri://error', () => {
     const target = tabs.find((tab) => tab.id === id);
@@ -326,7 +334,7 @@ const instantiateView = (id: string, url: string, shouldFocus: boolean) => {
 // 创建子 webview：始终先隐藏，加载完成（显示 loading）后再显示，避免加载期间白屏
 const presentWebview = async (tab: TabRecord, url: string) => {
   const isActive = tab.id === activeTabId;
-  tab.view = instantiateView(tab.id, url, false);
+  tab.view = await instantiateView(tab.id, url, false);
 
   if (!isActive || !tab.view) {
     tab.view?.hide().catch(() => undefined);
