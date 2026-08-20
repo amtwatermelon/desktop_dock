@@ -65,6 +65,97 @@ fn sanitize_file_name(name: &str) -> String {
     }
 }
 
+// 修复视频无法播放：站点 CDN（Cloudflare）对 mp4 等媒体错误地启用了 Brotli 压缩
+// （响应带 content-encoding: br 且不支持 Range/206）。Chrome 的媒体管线会透明解压，
+// 但 WKWebView / WebView2 的 <video> 管线拒绝带 content-encoding 的媒体响应，
+// 报 SRC_NOT_SUPPORTED，表现为视频黑屏不能播。
+// 修复方式：注入初始化脚本，把同源 <video>/<audio>/<source> 的 src 改写为
+// fetch（fetch/XHR 管线会正确解压 content-encoding）→ Blob → objectURL。
+// 仅处理同源 URL，避免跨域 CORS 问题。
+const MEDIA_FIX_SCRIPT: &str = r#"
+(function () {
+  if (window.__mediaFixInstalled) return;
+  window.__mediaFixInstalled = true;
+
+  var MEDIA_EXT = /\.(mp4|webm|mov|m4v|ogv|ogg|mp3|wav|m4a|aac|flac)(\?|$)/i;
+
+  function isSameOriginMedia(url) {
+    try {
+      var u = new URL(url, location.href);
+      if (u.origin !== location.origin) return false;
+      return MEDIA_EXT.test(u.pathname);
+    } catch (e) { return false; }
+  }
+
+  // 已处理/处理中的 src 集合，避免循环触发
+  var handled = new WeakSet();
+  var inFlight = new WeakSet();
+
+  function fixMediaSource(el) {
+    var src = el.getAttribute('src');
+    if (!src || !isSameOriginMedia(src)) return;
+    if (handled.has(el) || inFlight.has(el)) return;
+    inFlight.add(el);
+
+    var absUrl = new URL(src, location.href).href;
+    fetch(absUrl)
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.blob();
+      })
+      .then(function (blob) {
+        handled.add(el);
+        el.src = URL.createObjectURL(blob);
+        el.load();
+      })
+      .catch(function () {
+        // 失败则保留原 src，行为退回未修复状态
+      })
+      .finally(function () { inFlight.delete(el); });
+  }
+
+  function scan(root) {
+    try {
+      var nodes = (root || document).querySelectorAll('video, audio, source');
+      for (var i = 0; i < nodes.length; i++) fixMediaSource(nodes[i]);
+    } catch (e) {}
+  }
+
+  // 捕获加载失败的媒体，重试一次 blob 路径（防止扫描时序遗漏）
+  document.addEventListener('error', function (ev) {
+    var t = ev.target;
+    if (t && (t.tagName === 'VIDEO' || t.tagName === 'AUDIO' || t.tagName === 'SOURCE')) {
+      fixMediaSource(t);
+    }
+  }, true);
+
+  var mo = new MutationObserver(function (muts) {
+    for (var i = 0; i < muts.length; i++) {
+      var m = muts[i];
+      if (m.type === 'childList') {
+        for (var j = 0; j < m.addedNodes.length; j++) {
+          var n = m.addedNodes[j];
+          if (n.nodeType !== 1) continue;
+          if (n.tagName === 'VIDEO' || n.tagName === 'AUDIO' || n.tagName === 'SOURCE') fixMediaSource(n);
+          else if (n.querySelectorAll) scan(n);
+        }
+      } else if (m.type === 'attributes' && m.target.nodeType === 1) {
+        fixMediaSource(m.target);
+      }
+    }
+  });
+  mo.observe(document.documentElement, {
+    childList: true, subtree: true, attributes: true, attributeFilter: ['src']
+  });
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function () { scan(document); });
+  } else {
+    scan(document);
+  }
+})();
+"#;
+
 // 由 Rust 侧创建子 webview，以便在构建时挂上 on_download 下载处理器。
 // JS 的 new Webview(...) 走内置 create_webview 命令，不会附加下载钩子，
 // 导致点击下载按钮时 Windows/WebView2 无反应、macOS/WKWebView 静默失败。
@@ -94,11 +185,18 @@ async fn create_tab_webview(
                 // 循环投递任务并同步等待结果，而本回调就运行在主线程上，会自等待
                 // 死锁（弹窗后整个应用卡死）。rfd 检测到已在主线程后直接
                 // runModal / IFileDialog::Show，模态循环内部自行泵事件，是安全的。
-                match rfd::FileDialog::new()
+                //
+                // Windows 关键点：必须 set_parent 挂上宿主窗口。否则
+                // IFileDialog::Show(NULL) 的对话框无 owner，从 WebView2 事件回调里
+                // 弹出时不会被带到前台，看起来就是"点了没反应"（对话框其实弹在
+                // 主窗口后面）。macOS 上 run_modal 本身会强制接管，父窗口仅影响
+                // sheet 样式，无副作用。
+                let window = view.window();
+                let mut dialog = rfd::FileDialog::new()
                     .set_title("保存文件")
-                    .set_file_name(&suggested)
-                    .save_file()
-                {
+                    .set_file_name(&suggested);
+                dialog = dialog.set_parent(&window);
+                match dialog.save_file() {
                     Some(p) => {
                         *destination = p;
                         true
@@ -123,7 +221,14 @@ async fn create_tab_webview(
                 true
             }
             _ => true,
-        });
+        })
+        // 不注册 on_new_window 时，wry 在 Windows 上对 window.open 的默认行为是
+        // SetHandled(true) 直接静默拒绝（macOS 无 handler 时由 WebKit 默认放行）。
+        // 聊天页面里的视频播放器/登录弹窗等依赖 window.open，会被无声吞掉，
+        // 表现为"视频点不开"。这里放行为系统默认行为。
+        .on_new_window(|_url, _features| tauri::webview::NewWindowResponse::Allow)
+        // 视频播放修复脚本（见 MEDIA_FIX_SCRIPT 注释），在每个页面加载前注入
+        .initialization_script(MEDIA_FIX_SCRIPT.to_string());
 
     window
         .add_child(
