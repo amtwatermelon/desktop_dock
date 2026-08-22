@@ -21,6 +21,9 @@ mod yy_bridge {
     pub const POLL_INTERVAL_MS: u64 = 150;
     // 我们窗口失焦后该时长内的剪贴板文本变化视为快捷回复（说明文档 §10 方案B）
     pub const CAPTURE_WINDOW_MS: u128 = 10_000;
+    // blur→focus 转换后的宽限期：易歪歪先把我们窗口拉到前台再写剪贴板，
+    // 此间的剪贴板变化仍视为快捷回复，而不是"用户自己复制"
+    pub const REFOCUS_GRACE_MS: u128 = 2_000;
     // 前台进程允许清单（exe 文件名小写）。真实 exe 名上线后按 [YY-DEBUG] 日志修正。
     pub const FOREGROUND_ALLOWLIST: &[&str] = &["yiwaiwai.exe", "易歪歪.exe", "yy.exe"];
     // 调试日志只打长度与截断预览，不打印全文（说明文档 §16）
@@ -58,6 +61,11 @@ mod yy_clipboard {
     // 由 on_window_event 维护：我们窗口当前是否聚焦、上次失焦时间
     pub static WINDOW_FOCUSED: AtomicBool = AtomicBool::new(false);
     pub static LAST_BLUR_AT: Mutex<Option<Instant>> = Mutex::new(None);
+    // 最近一次 blur→focus 转换的时间：易歪歪快捷回复的时序是
+    // "先把我们的窗口激活到前台 → 写剪贴板 → 发粘贴"，剪贴板变化落在
+    // 聚焦后几百毫秒内。没有这个宽限期，聚焦门槛会把快捷回复误判成
+    // "用户自己复制"而跳过（表现为要点 3 次才成功）。
+    pub static LAST_FOCUS_AT: Mutex<Option<Instant>> = Mutex::new(None);
 
     // 日志串行写（监视线程 + 窗口事件回调都会写）
     fn log_lock() -> &'static Mutex<()> {
@@ -202,19 +210,29 @@ mod yy_clipboard {
                         None => false,
                     }
                 };
+                // blur→focus 宽限期内：易歪歪刚把我们拉到前台、剪贴板随后就变，
+                // 这是快捷回复不是用户复制
+                let in_refocus_grace = {
+                    let last_focus = LAST_FOCUS_AT.lock().unwrap();
+                    match *last_focus {
+                        Some(t) => t.elapsed().as_millis() <= REFOCUS_GRACE_MS,
+                        None => false,
+                    }
+                };
                 log(format_args!(
-                    "[YY-DEBUG] focused={focused} foreground={foreground:?} allowed={fg_allowed} in_capture_window={in_capture_window}"
+                    "[YY-DEBUG] focused={focused} foreground={foreground:?} allowed={fg_allowed} in_capture_window={in_capture_window} in_refocus_grace={in_refocus_grace}"
                 ));
 
-                // 窗口聚焦中的剪贴板变化 = 用户自己复制，不处理（§9.1）
-                if focused {
+                if focused && !in_refocus_grace {
+                    // 稳定聚焦中的剪贴板变化 = 用户自己复制，不处理（§9.1）。
+                    // 注意：刚被外部激活（宽限期内）的除外，见 REFOCUS_GRACE_MS。
                     log(format_args!(
                         "[YY-DEBUG] skip: our window focused (user normal copy)"
                     ));
                     continue;
                 }
-                // 前台不是易歪歪且失焦时间窗已过 → 别处的普通复制，不处理
-                if !fg_allowed && !in_capture_window {
+                if !fg_allowed && !in_capture_window && !in_refocus_grace {
+                    // 前台不是易歪歪、失焦窗口期和 refocus 宽限期都过了 → 别处的普通复制
                     log(format_args!("[YY-DEBUG] skip: gate denied"));
                     continue;
                 }
@@ -531,6 +549,7 @@ fn main() {
             // 失焦时间戳用于限定"快捷回复捕获窗口"。只记录，不抢焦点。
             #[cfg(target_os = "windows")]
             if let tauri::WindowEvent::Focused(focused) = event {
+                let was_focused = yy_clipboard::WINDOW_FOCUSED.swap(*focused, std::sync::atomic::Ordering::Relaxed);
                 yy_clipboard::WINDOW_FOCUSED.store(*focused, std::sync::atomic::Ordering::Relaxed);
                 if !*focused {
                     let mut last_blur = yy_clipboard::LAST_BLUR_AT.lock().unwrap();
@@ -538,6 +557,14 @@ fn main() {
                     yy_clipboard::log(format_args!(
                         "[YY-DEBUG] window blurred, capture window opens ({}ms)",
                         yy_bridge::CAPTURE_WINDOW_MS
+                    ));
+                } else if !was_focused {
+                    // blur→focus 转换：开启 refocus 宽限期（易歪歪可能随后写剪贴板）
+                    let mut last_focus = yy_clipboard::LAST_FOCUS_AT.lock().unwrap();
+                    *last_focus = Some(std::time::Instant::now());
+                    yy_clipboard::log(format_args!(
+                        "[YY-DEBUG] window refocused, grace window opens ({}ms)",
+                        yy_bridge::REFOCUS_GRACE_MS
                     ));
                 }
             }
