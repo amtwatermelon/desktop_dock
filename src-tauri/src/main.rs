@@ -16,7 +16,9 @@ use tauri_plugin_notification::NotificationExt;
 #[cfg(target_os = "windows")]
 mod yy_bridge {
     pub const ENABLED: bool = true;
-    pub const POLL_INTERVAL_MS: u64 = 300;
+    // 诊断期收紧轮询间隔：易歪歪可能是"写剪贴板→立即还原"的瞬时操作，
+    // 300ms 可能漏看中间状态（序列号仍会递增，但前台进程可能已切走）。
+    pub const POLL_INTERVAL_MS: u64 = 150;
     // 我们窗口失焦后该时长内的剪贴板文本变化视为快捷回复（说明文档 §10 方案B）
     pub const CAPTURE_WINDOW_MS: u128 = 10_000;
     // 前台进程允许清单（exe 文件名小写）。真实 exe 名上线后按 [YY-DEBUG] 日志修正。
@@ -29,9 +31,11 @@ mod yy_bridge {
 // ==== 易歪歪 Clipboard Bridge 实现（仅 Windows）====
 #[cfg(target_os = "windows")]
 mod yy_clipboard {
+    use std::io::Write;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use tauri::{AppHandle, Emitter};
 
@@ -54,6 +58,37 @@ mod yy_clipboard {
     // 由 on_window_event 维护：我们窗口当前是否聚焦、上次失焦时间
     pub static WINDOW_FOCUSED: AtomicBool = AtomicBool::new(false);
     pub static LAST_BLUR_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+    // 日志串行写（监视线程 + 窗口事件回调都会写）
+    fn log_lock() -> &'static Mutex<()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        &LOCK
+    }
+
+    /// [YY-DEBUG] 同时写 stdout 和 %APPDATA%\007Desk\yy-bridge.log。
+    /// release 包 windows_subsystem=windows 没有 stdout，文件是唯一现场。
+    pub fn log(args: std::fmt::Arguments) {
+        let line = format!("[{}] {}", {
+            let secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let (h, m, s) = (secs / 3600 % 24, secs / 60 % 60, secs % 60);
+            format!("{h:02}:{m:02}:{s:02}")
+        }, args);
+        println!("{line}");
+        let _guard = log_lock().lock().unwrap();
+        let Ok(app_data) = std::env::var("APPDATA") else { return };
+        let dir = PathBuf::from(app_data).join("007Desk");
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("yy-bridge.log"))
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
 
     /// 前台进程 exe 名（小写，如 "yiwaiwai.exe"）。查询失败返回 None。
     fn foreground_process_name() -> Option<String> {
@@ -136,7 +171,9 @@ mod yy_clipboard {
     pub fn spawn_monitor(app: AppHandle) {
         std::thread::spawn(move || {
             let mut last_seq = unsafe { GetClipboardSequenceNumber() };
-            println!("[YY-DEBUG] clipboard monitor started, initial seq={last_seq}");
+            log(format_args!(
+                "[YY-DEBUG] clipboard monitor started, initial seq={last_seq}"
+            ));
             loop {
                 std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
                 if !ENABLED {
@@ -148,7 +185,7 @@ mod yy_clipboard {
                     continue;
                 }
                 last_seq = seq;
-                println!("[YY-DEBUG] Clipboard changed, seq={seq}");
+                log(format_args!("[YY-DEBUG] Clipboard changed, seq={seq}"));
 
                 // —— 接收门槛（说明文档 §10）——
                 let focused = WINDOW_FOCUSED.load(Ordering::Relaxed);
@@ -165,40 +202,44 @@ mod yy_clipboard {
                         None => false,
                     }
                 };
-                println!(
+                log(format_args!(
                     "[YY-DEBUG] focused={focused} foreground={foreground:?} allowed={fg_allowed} in_capture_window={in_capture_window}"
-                );
+                ));
 
                 // 窗口聚焦中的剪贴板变化 = 用户自己复制，不处理（§9.1）
                 if focused {
-                    println!("[YY-DEBUG] skip: our window focused (user normal copy)");
+                    log(format_args!(
+                        "[YY-DEBUG] skip: our window focused (user normal copy)"
+                    ));
                     continue;
                 }
                 // 前台不是易歪歪且失焦时间窗已过 → 别处的普通复制，不处理
                 if !fg_allowed && !in_capture_window {
-                    println!("[YY-DEBUG] skip: gate denied");
+                    log(format_args!("[YY-DEBUG] skip: gate denied"));
                     continue;
                 }
 
                 let Some(raw) = read_clipboard_text_with_retry() else {
-                    println!("[YY-DEBUG] skip: no text (image or delayed render)");
+                    log(format_args!(
+                        "[YY-DEBUG] skip: no text (image or delayed render)"
+                    ));
                     continue;
                 };
                 let text = raw.trim().to_string();
                 if text.is_empty() {
-                    println!("[YY-DEBUG] skip: empty text");
+                    log(format_args!("[YY-DEBUG] skip: empty text"));
                     continue;
                 }
 
                 let preview: String = text.chars().take(LOG_PREVIEW_CHARS).collect();
-                println!(
+                log(format_args!(
                     "[YY-DEBUG] text length={} preview={preview}…",
                     text.chars().count()
-                );
+                ));
 
                 match app.emit(EVENT_NAME, serde_json::json!({ "text": text })) {
-                    Ok(_) => println!("[YY-DEBUG] Clipboard event emitted"),
-                    Err(e) => println!("[YY-DEBUG] emit failed: {e}"),
+                    Ok(_) => log(format_args!("[YY-DEBUG] Clipboard event emitted")),
+                    Err(e) => log(format_args!("[YY-DEBUG] emit failed: {e}")),
                 }
                 // 不清空剪贴板（§10 方案C），不破坏用户复制/粘贴
             }
@@ -480,10 +521,10 @@ fn main() {
                 if !*focused {
                     let mut last_blur = yy_clipboard::LAST_BLUR_AT.lock().unwrap();
                     *last_blur = Some(std::time::Instant::now());
-                    println!(
+                    yy_clipboard::log(format_args!(
                         "[YY-DEBUG] window blurred, capture window opens ({}ms)",
                         yy_bridge::CAPTURE_WINDOW_MS
-                    );
+                    ));
                 }
             }
         })

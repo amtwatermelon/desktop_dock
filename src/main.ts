@@ -643,8 +643,17 @@ const initQuickReplyListener = async () => {
     try {
       const result = await (tab.view as any).eval(buildQuickReplyInsertScript(event.payload.text));
       console.log('[YY-DEBUG] insert result:', String(result).slice(0, 120));
+      // 诊断信号：系统通知告知链路已通（结果可能是 no-editable，内容见通知）
+      void sendNotification({
+        title: 'YY-Bridge 收到快捷回复',
+        body: String(result).slice(0, 80),
+      });
     } catch (error) {
       console.warn('[YY-DEBUG] insert eval failed:', error);
+      void sendNotification({
+        title: 'YY-Bridge 插入失败',
+        body: String(error).slice(0, 80),
+      });
     }
   });
   console.log('[YY-DEBUG] clipboard-quick-reply listener installed');
