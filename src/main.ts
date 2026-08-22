@@ -1,5 +1,6 @@
 import './style.css';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { Webview } from '@tauri-apps/api/webview';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { LogicalPosition, LogicalSize } from '@tauri-apps/api/dpi';
@@ -570,6 +571,85 @@ const showActiveWebview = async () => {
   await active.view.setFocus().catch(() => undefined);
 };
 
+// ==== 易歪歪 Clipboard Bridge（仅 Windows 会收到事件，macOS 走系统原生行为）====
+// Rust 侧监听到"失焦期间易歪歪写入剪贴板"后 emit `clipboard-quick-reply`，
+// 这里把文本插入活动页签的输入框（光标处追加，不覆盖已有内容）。
+const isSettingsModalOpen = () => settingsModalEl.classList.contains('open');
+
+// 注入外部页面的插入脚本。IIFE + 表达式返回，兼容 (view as any).eval 模式（见 pollTabUrl）。
+// 文本经 JSON.stringify 内嵌，任意引号/换行/unicode 均安全。
+const buildQuickReplyInsertScript = (text: string) => `
+(() => {
+  const isEditable = (el) => {
+    if (!el || el.nodeType !== 1) return false;
+    const tag = el.tagName;
+    if (tag === 'INPUT') {
+      const t = (el.getAttribute('type') || 'text').toLowerCase();
+      return ['text', 'search', 'url', 'tel', 'email', ''].includes(t);
+    }
+    if (tag === 'TEXTAREA') return true;
+    return el.isContentEditable === true;
+  };
+  // 目标：当前聚焦的可编辑元素，否则退回 MEDIA_FIX_SCRIPT 追踪的最近输入框
+  const tracked = window.__yyLastEditable;
+  const target = isEditable(document.activeElement)
+    ? document.activeElement
+    : (isEditable(tracked) && tracked.isConnected ? tracked : null);
+  if (!target) return JSON.stringify({ ok: false, reason: 'no-editable' });
+  try { target.focus(); } catch (e) {}
+  const text = ${JSON.stringify(text)};
+  // 首选 execCommand：触发原生 input 事件，React/Vue 受控组件能正常同步状态
+  let inserted = false;
+  try { inserted = document.execCommand('insertText', false, text); } catch (e) {}
+  if (!inserted) {
+    if (typeof target.setRangeText === 'function') {
+      // <input>/<textarea> 降级：光标处拼接 + 手动派发 input 事件
+      const start = target.selectionStart ?? target.value.length;
+      const end = target.selectionEnd ?? start;
+      target.setRangeText(text, start, end, 'end');
+      target.dispatchEvent(new InputEvent('input', { bubbles: true, data: text, inputType: 'insertText' }));
+      inserted = true;
+    } else if (target.isContentEditable) {
+      // contenteditable 降级：Range 插入文本节点 + 派发 input 事件
+      const sel = window.getSelection();
+      if (sel && sel.rangeCount) {
+        const range = sel.getRangeAt(0);
+        range.deleteContents();
+        range.insertNode(document.createTextNode(text));
+        range.collapse(false);
+        target.dispatchEvent(new InputEvent('input', { bubbles: true, data: text, inputType: 'insertText' }));
+        inserted = true;
+      }
+    }
+  }
+  return JSON.stringify({ ok: inserted, tag: target.tagName });
+})()
+`;
+
+const initQuickReplyListener = async () => {
+  await listen<{ text: string }>('clipboard-quick-reply', async (event) => {
+    console.log('[YY-DEBUG] Frontend received clipboard-quick-reply (len=%d)', event.payload.text.length);
+    // 守卫 1：设置弹窗打开 → 忽略
+    if (isSettingsModalOpen()) {
+      console.log('[YY-DEBUG] skip: settings modal open');
+      return;
+    }
+    // 守卫 2：无活动页签 / webview 未就绪 → 忽略
+    const tab = getActiveTab();
+    if (!tab?.view) {
+      console.log('[YY-DEBUG] skip: no active tab');
+      return;
+    }
+    try {
+      const result = await (tab.view as any).eval(buildQuickReplyInsertScript(event.payload.text));
+      console.log('[YY-DEBUG] insert result:', String(result).slice(0, 120));
+    } catch (error) {
+      console.warn('[YY-DEBUG] insert eval failed:', error);
+    }
+  });
+  console.log('[YY-DEBUG] clipboard-quick-reply listener installed');
+};
+
 const hideSettingsModal = () => {
   settingsModalEl.classList.remove('open');
   settingsModalEl.setAttribute('aria-hidden', 'true');
@@ -736,6 +816,7 @@ console.log('🚀 应用初始化开始...');
 console.log('💡 在主窗口控制台执行: testNotify()');
 void initNotificationPermission();
 refreshViewportBounds();
+void initQuickReplyListener();
 void createTab();
 console.log('✅ 应用初始化完成');
 

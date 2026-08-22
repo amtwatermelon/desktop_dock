@@ -8,6 +8,204 @@ use std::path::PathBuf;
 use tauri::{Manager, WebviewUrl};
 use tauri_plugin_notification::NotificationExt;
 
+// ==== 易歪歪 Clipboard Bridge 配置（仅 Windows 生效）====
+// 背景见根目录《Tauri_兼容易歪歪快捷回复调整说明.md》：
+// 点击易歪歪快捷回复时它把文本写入 Windows 剪贴板，但我们的窗口已失去前台焦点，
+// 粘贴落不进 WebView2 输入框。方案是 Rust 侧监听剪贴板变化 → emit 事件 →
+// 前端把文本插入活动页签的输入框。全程不抢 Windows 前台焦点。
+#[cfg(target_os = "windows")]
+mod yy_bridge {
+    pub const ENABLED: bool = true;
+    pub const POLL_INTERVAL_MS: u64 = 300;
+    // 我们窗口失焦后该时长内的剪贴板文本变化视为快捷回复（说明文档 §10 方案B）
+    pub const CAPTURE_WINDOW_MS: u128 = 10_000;
+    // 前台进程允许清单（exe 文件名小写）。真实 exe 名上线后按 [YY-DEBUG] 日志修正。
+    pub const FOREGROUND_ALLOWLIST: &[&str] = &["yiwaiwai.exe", "易歪歪.exe", "yy.exe"];
+    // 调试日志只打长度与截断预览，不打印全文（说明文档 §16）
+    pub const LOG_PREVIEW_CHARS: usize = 8;
+    pub const EVENT_NAME: &str = "clipboard-quick-reply";
+}
+
+// ==== 易歪歪 Clipboard Bridge 实现（仅 Windows）====
+#[cfg(target_os = "windows")]
+mod yy_clipboard {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    use tauri::{AppHandle, Emitter};
+
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{CloseHandle, HGLOBAL, HWND};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, OpenClipboard,
+    };
+    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClipboardSequenceNumber, GetForegroundWindow, GetWindowThreadProcessId,
+    };
+
+    use super::yy_bridge::*;
+
+    // 由 on_window_event 维护：我们窗口当前是否聚焦、上次失焦时间
+    pub static WINDOW_FOCUSED: AtomicBool = AtomicBool::new(false);
+    pub static LAST_BLUR_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+    /// 前台进程 exe 名（小写，如 "yiwaiwai.exe"）。查询失败返回 None。
+    fn foreground_process_name() -> Option<String> {
+        unsafe {
+            let hwnd: HWND = GetForegroundWindow();
+            if hwnd.0.is_null() {
+                return None;
+            }
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid == 0 {
+                return None;
+            }
+            let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+                return None;
+            };
+            let mut buf = [0u16; 512];
+            let mut len = buf.len() as u32;
+            let queried = QueryFullProcessImageNameW(
+                handle,
+                PROCESS_NAME_WIN32,
+                PWSTR(buf.as_mut_ptr()),
+                &mut len,
+            )
+            .is_ok();
+            let _ = CloseHandle(handle);
+            if !queried {
+                return None;
+            }
+            let path = String::from_utf16_lossy(&buf[..len as usize]);
+            path.rsplit(['\\', '/'])
+                .next()
+                .map(|s| s.to_lowercase())
+        }
+    }
+
+    /// 读取剪贴板文本（CF_UNICODETEXT）。非文本格式或打开失败返回 None。
+    fn read_clipboard_text() -> Option<String> {
+        unsafe {
+            if !OpenClipboard(None).is_ok() {
+                return None; // 被其他进程占用 → 由调用方小重试兜底
+            }
+            let result = (|| {
+                // CF_UNICODETEXT = 13
+                let Ok(handle) = GetClipboardData(13) else {
+                    return None;
+                };
+                let hglobal = HGLOBAL(handle.0);
+                let ptr = GlobalLock(hglobal) as *const u16;
+                if ptr.is_null() {
+                    return None;
+                }
+                let mut len = 0usize;
+                while *ptr.add(len) != 0 {
+                    len += 1;
+                }
+                let text = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
+                let _ = GlobalUnlock(hglobal);
+                Some(text)
+            })();
+            let _ = CloseClipboard();
+            result
+        }
+    }
+
+    /// 带小重试的文本读取：易歪歪可能用 delayed render 写剪贴板，序列号先变、
+    /// 数据稍后才可读。
+    fn read_clipboard_text_with_retry() -> Option<String> {
+        for attempt in 0..3 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            if let Some(text) = read_clipboard_text() {
+                return Some(text);
+            }
+        }
+        None
+    }
+
+    pub fn spawn_monitor(app: AppHandle) {
+        std::thread::spawn(move || {
+            let mut last_seq = unsafe { GetClipboardSequenceNumber() };
+            println!("[YY-DEBUG] clipboard monitor started, initial seq={last_seq}");
+            loop {
+                std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+                if !ENABLED {
+                    continue;
+                }
+
+                let seq = unsafe { GetClipboardSequenceNumber() };
+                if seq == last_seq {
+                    continue;
+                }
+                last_seq = seq;
+                println!("[YY-DEBUG] Clipboard changed, seq={seq}");
+
+                // —— 接收门槛（说明文档 §10）——
+                let focused = WINDOW_FOCUSED.load(Ordering::Relaxed);
+                let foreground = foreground_process_name();
+                let fg_allowed = foreground
+                    .as_deref()
+                    .map(|name| FOREGROUND_ALLOWLIST.iter().any(|allowed| *allowed == name))
+                    .unwrap_or(false);
+                let in_capture_window = {
+                    let last_blur = LAST_BLUR_AT.lock().unwrap();
+                    match *last_blur {
+                        Some(t) => t.elapsed().as_millis() <= CAPTURE_WINDOW_MS,
+                        // 启动后从未聚焦/失焦过 → 不处理
+                        None => false,
+                    }
+                };
+                println!(
+                    "[YY-DEBUG] focused={focused} foreground={foreground:?} allowed={fg_allowed} in_capture_window={in_capture_window}"
+                );
+
+                // 窗口聚焦中的剪贴板变化 = 用户自己复制，不处理（§9.1）
+                if focused {
+                    println!("[YY-DEBUG] skip: our window focused (user normal copy)");
+                    continue;
+                }
+                // 前台不是易歪歪且失焦时间窗已过 → 别处的普通复制，不处理
+                if !fg_allowed && !in_capture_window {
+                    println!("[YY-DEBUG] skip: gate denied");
+                    continue;
+                }
+
+                let Some(raw) = read_clipboard_text_with_retry() else {
+                    println!("[YY-DEBUG] skip: no text (image or delayed render)");
+                    continue;
+                };
+                let text = raw.trim().to_string();
+                if text.is_empty() {
+                    println!("[YY-DEBUG] skip: empty text");
+                    continue;
+                }
+
+                let preview: String = text.chars().take(LOG_PREVIEW_CHARS).collect();
+                println!(
+                    "[YY-DEBUG] text length={} preview={preview}…",
+                    text.chars().count()
+                );
+
+                match app.emit(EVENT_NAME, serde_json::json!({ "text": text })) {
+                    Ok(_) => println!("[YY-DEBUG] Clipboard event emitted"),
+                    Err(e) => println!("[YY-DEBUG] emit failed: {e}"),
+                }
+                // 不清空剪贴板（§10 方案C），不破坏用户复制/粘贴
+            }
+        });
+    }
+}
+
 // 接收来自 webview 的通知请求
 #[tauri::command]
 async fn send_notification(
@@ -153,6 +351,27 @@ const MEDIA_FIX_SCRIPT: &str = r#"
   } else {
     scan(document);
   }
+
+  // ==== 易歪歪 Clipboard Bridge：记录最近聚焦的可编辑元素 ====
+  // 窗口失焦后部分 WebView2 版本会丢失 activeElement，这里在 focusin 时缓存一份，
+  // 供剪贴板快捷回复插入脚本（见 src/main.ts）定位目标输入框。
+  window.__yyLastEditable = null;
+  function __yyIsEditable(el) {
+    if (!el || el.nodeType !== 1) return false;
+    var tag = el.tagName;
+    if (tag === 'INPUT') {
+      var t = (el.getAttribute('type') || 'text').toLowerCase();
+      return ['text', 'search', 'url', 'tel', 'email', ''].indexOf(t) !== -1;
+    }
+    if (tag === 'TEXTAREA') return true;
+    return el.isContentEditable === true;
+  }
+  document.addEventListener('focusin', function (ev) {
+    if (__yyIsEditable(ev.target)) window.__yyLastEditable = ev.target;
+  }, true);
+  document.addEventListener('DOMContentLoaded', function () {
+    if (__yyIsEditable(document.activeElement)) window.__yyLastEditable = document.activeElement;
+  });
 })();
 "#;
 
@@ -244,6 +463,30 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        .setup(|app| {
+            // 易歪歪 Clipboard Bridge：启动剪贴板监视线程（仅 Windows）
+            #[cfg(target_os = "windows")]
+            yy_clipboard::spawn_monitor(app.handle().clone());
+            #[cfg(not(target_os = "windows"))]
+            let _ = app; // macOS 上无监视线程，消除 unused 警告
+            Ok(())
+        })
+        .on_window_event(|_window, #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] event| {
+            // 维护易歪歪 Bridge 的焦点状态：聚焦中不处理剪贴板（用户自己复制），
+            // 失焦时间戳用于限定"快捷回复捕获窗口"。只记录，不抢焦点。
+            #[cfg(target_os = "windows")]
+            if let tauri::WindowEvent::Focused(focused) = event {
+                yy_clipboard::WINDOW_FOCUSED.store(*focused, std::sync::atomic::Ordering::Relaxed);
+                if !*focused {
+                    let mut last_blur = yy_clipboard::LAST_BLUR_AT.lock().unwrap();
+                    *last_blur = Some(std::time::Instant::now());
+                    println!(
+                        "[YY-DEBUG] window blurred, capture window opens ({}ms)",
+                        yy_bridge::CAPTURE_WINDOW_MS
+                    );
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             send_notification,
             create_tab_webview
