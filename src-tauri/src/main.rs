@@ -416,6 +416,20 @@ const MEDIA_FIX_SCRIPT: &str = r#"
 })();
 "#;
 
+// JS 侧 Webview 类没有 eval 方法（v2 只保留 Rust 侧 Webview::eval），
+// 主窗口需要向子 webview 注入脚本时统一走本命令中转。
+#[tauri::command]
+async fn eval_in_webview(
+    app: tauri::AppHandle,
+    label: String,
+    js: String,
+) -> Result<(), String> {
+    let webview = app
+        .get_webview(&label)
+        .ok_or_else(|| format!("webview {label} not found"))?;
+    webview.eval(js).map_err(|e| e.to_string())
+}
+
 // 由 Rust 侧创建子 webview，以便在构建时挂上 on_download 下载处理器。
 // JS 的 new Webview(...) 走内置 create_webview 命令，不会附加下载钩子，
 // 导致点击下载按钮时 Windows/WebView2 无反应、macOS/WKWebView 静默失败。
@@ -530,7 +544,8 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             send_notification,
-            create_tab_webview
+            create_tab_webview,
+            eval_in_webview
         ])
         .run(tauri::generate_context!())
         .expect("运行 Tauri 应用失败");

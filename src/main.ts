@@ -274,21 +274,31 @@ const syncBounds = async (tab: TabRecord) => {
   await tab.view.setSize(new LogicalSize(bounds.width, bounds.height));
 };
 
-// 轮询子 webview 的 document.readyState，加载完成（或超时）后再展示，避免白屏
+// 向子 webview 注入脚本。@tauri-apps/api 2.x 的 Webview 类没有 eval 方法
+// （v2 只保留 Rust 侧 Webview::eval），统一走 Rust 命令 eval_in_webview 中转。
+// eval 是 fire-and-forget 拿不到返回值。
+const runWebviewScript = (view: Webview, js: string) =>
+  invoke('eval_in_webview', { label: view.label, js });
+
+// 轮询子 webview 的 document.readyState，加载完成（或超时）后再展示，避免白屏。
+// eval 拿不到返回值：注入脚本自判断，就绪时通过 __TAURI__.event.emit 通知主窗口
+// （withGlobalTauri 开启且 capabilities 覆盖 tab-*，事件可达；异常则超时兜底展示）。
 const waitForWebviewLoad = (view: Webview, timeoutMs = 12000) =>
   new Promise<void>((resolve) => {
     const startedAt = Date.now();
+    const checkScript = `
+      if (document.readyState === 'complete' && window.__TAURI__?.event?.emit) {
+        window.__TAURI__.event.emit('yy-webview-ready', { label: ${JSON.stringify(view.label)} });
+      }
+    `;
     const tick = async () => {
       try {
-        const ready = (await (view as any).eval('document.readyState')) as string;
-        if (ready === 'complete') {
-          resolve();
-          return;
-        }
+        await runWebviewScript(view, checkScript);
       } catch {
         // webview 尚未就绪，忽略后继续轮询
       }
-      if (Date.now() - startedAt >= timeoutMs) {
+      if (readyViews.has(view.label) || Date.now() - startedAt >= timeoutMs) {
+        readyViews.delete(view.label);
         resolve();
         return;
       }
@@ -296,6 +306,16 @@ const waitForWebviewLoad = (view: Webview, timeoutMs = 12000) =>
     };
     window.setTimeout(tick, 150);
   });
+
+// 就绪回传事件的监听（见 waitForWebviewLoad）
+const readyViews = new Set<string>();
+const initWebviewReadyListener = async () => {
+  await listen<{ label: string }>('yy-webview-ready', (event) => {
+    if (event.payload?.label) {
+      readyViews.add(event.payload.label);
+    }
+  });
+};
 
 // 通过 Rust 侧命令创建子 webview：只有这样才能在构建时挂上 on_download 下载处理器，
 // 页面里的下载（图片/视频/文件）才会弹出"另存为"对话框。JS 的 new Webview(...) 不行。
@@ -472,16 +492,31 @@ const cleanupUrlWatcher = (id: string) => {
   }
 };
 
+// 页签 URL/标题回传：注入脚本通过 __TAURI__.event.emit 发回主窗口
+const initTabUrlListener = async () => {
+  await listen<{ label: string; href: string; title: string }>('yy-tab-url', (event) => {
+    const tab = tabs.find((item) => item.id === event.payload?.label);
+    if (tab && typeof event.payload.href === 'string' && event.payload.href) {
+      applyTabUrl(tab, event.payload.href, event.payload.title);
+    }
+  });
+};
+
 const pollTabUrl = async (tab: TabRecord) => {
   if (!tab.view) return;
   try {
-    const latest = (await (tab.view as any).eval(
-      '({ href: window.location.href, title: document.title || "" })'
-    )) as { href: string; title: string };
-
-    if (latest && typeof latest.href === 'string' && latest.href) {
-      applyTabUrl(tab, latest.href, latest.title);
-    }
+    await runWebviewScript(
+      tab.view,
+      `
+        if (window.__TAURI__?.event?.emit) {
+          window.__TAURI__.event.emit('yy-tab-url', {
+            label: ${JSON.stringify(tab.id)},
+            href: window.location.href,
+            title: document.title || ''
+          });
+        }
+      `
+    );
   } catch {
     // ignore cross-origin / timing errors
   }
@@ -576,10 +611,17 @@ const showActiveWebview = async () => {
 // 这里把文本插入活动页签的输入框（光标处追加，不覆盖已有内容）。
 const isSettingsModalOpen = () => settingsModalEl.classList.contains('open');
 
-// 注入外部页面的插入脚本。IIFE + 表达式返回，兼容 (view as any).eval 模式（见 pollTabUrl）。
-// 文本经 JSON.stringify 内嵌，任意引号/换行/unicode 均安全。
+// 注入外部页面的插入脚本。eval 无返回值：结果通过 __TAURI__.event.emit 回传
+// （见 initInsertResultListener）。文本经 JSON.stringify 内嵌，任意引号/换行/unicode 安全。
 const buildQuickReplyInsertScript = (text: string) => `
 (() => {
+  const report = (result) => {
+    try {
+      if (window.__TAURI__?.event?.emit) {
+        window.__TAURI__.event.emit('yy-insert-result', result);
+      }
+    } catch (e) {}
+  };
   const isEditable = (el) => {
     if (!el || el.nodeType !== 1) return false;
     const tag = el.tagName;
@@ -595,7 +637,7 @@ const buildQuickReplyInsertScript = (text: string) => `
   const target = isEditable(document.activeElement)
     ? document.activeElement
     : (isEditable(tracked) && tracked.isConnected ? tracked : null);
-  if (!target) return JSON.stringify({ ok: false, reason: 'no-editable' });
+  if (!target) { report({ ok: false, reason: 'no-editable' }); return; }
   try { target.focus(); } catch (e) {}
   const text = ${JSON.stringify(text)};
   // 首选 execCommand：触发原生 input 事件，React/Vue 受控组件能正常同步状态
@@ -622,9 +664,21 @@ const buildQuickReplyInsertScript = (text: string) => `
       }
     }
   }
-  return JSON.stringify({ ok: inserted, tag: target.tagName });
+  report({ ok: inserted, tag: target.tagName });
 })()
 `;
+
+// 插入结果回传监听：诊断信号（系统通知），见 buildQuickReplyInsertScript 的 report()
+const initInsertResultListener = async () => {
+  await listen<{ ok: boolean; reason?: string; tag?: string }>('yy-insert-result', (event) => {
+    const result = event.payload;
+    console.log('[YY-DEBUG] insert result:', JSON.stringify(result));
+    void sendNotification({
+      title: result.ok ? 'YY-Bridge 插入成功' : 'YY-Bridge 未插入',
+      body: JSON.stringify(result).slice(0, 80),
+    });
+  });
+};
 
 const initQuickReplyListener = async () => {
   await listen<{ text: string }>('clipboard-quick-reply', async (event) => {
@@ -641,13 +695,12 @@ const initQuickReplyListener = async () => {
       return;
     }
     try {
-      const result = await (tab.view as any).eval(buildQuickReplyInsertScript(event.payload.text));
-      console.log('[YY-DEBUG] insert result:', String(result).slice(0, 120));
-      // 诊断信号：系统通知告知链路已通（结果可能是 no-editable，内容见通知）
-      void sendNotification({
-        title: 'YY-Bridge 收到快捷回复',
-        body: String(result).slice(0, 80),
-      });
+      await runWebviewScript(tab.view, buildQuickReplyInsertScript(event.payload.text));
+      // 结果经 yy-insert-result 事件回传（见 initInsertResultListener）；
+      // 若 5 秒内无回传（脚本异常/页面无 __TAURI__），提示注入超时
+      window.setTimeout(() => {
+        console.warn('[YY-DEBUG] no yy-insert-result within 5s');
+      }, 5000);
     } catch (error) {
       console.warn('[YY-DEBUG] insert eval failed:', error);
       void sendNotification({
@@ -825,6 +878,9 @@ console.log('🚀 应用初始化开始...');
 console.log('💡 在主窗口控制台执行: testNotify()');
 void initNotificationPermission();
 refreshViewportBounds();
+void initWebviewReadyListener();
+void initTabUrlListener();
+void initInsertResultListener();
 void initQuickReplyListener();
 void createTab();
 console.log('✅ 应用初始化完成');
