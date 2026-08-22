@@ -38,7 +38,7 @@ mod yy_clipboard {
     use windows::core::PWSTR;
     use windows::Win32::Foundation::{CloseHandle, HGLOBAL, HWND};
     use windows::Win32::System::DataExchange::{
-        CloseClipboard, GetClipboardData, OpenClipboard,
+        CloseClipboard, GetClipboardData, GetClipboardSequenceNumber, OpenClipboard,
     };
     use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
     use windows::Win32::System::Threading::{
@@ -46,7 +46,7 @@ mod yy_clipboard {
         QueryFullProcessImageNameW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetClipboardSequenceNumber, GetForegroundWindow, GetWindowThreadProcessId,
+        GetForegroundWindow, GetWindowThreadProcessId,
     };
 
     use super::yy_bridge::*;
